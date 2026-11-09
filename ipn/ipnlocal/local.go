@@ -1695,15 +1695,19 @@ var debugWhoIs = envknob.RegisterBool("TS_DEBUG_WHOIS")
 // the lookup will be done for TCP and then UDP, in that order.
 //
 // If ok == true, n and u are valid.
+//
+// WhoIs does not take b.mu. Every lookup goes through the current
+// nodeBackend, which has its own lock, and a ProxyMapper miss sleeps
+// through its registration retries (see proxymap.Mapper.WhoIsIPPort);
+// holding b.mu across those sleeps stalled every other LocalBackend
+// user, including netstack's inbound TCP accept path, whenever whois
+// callers asked about addresses that were not proxied.
 func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
 	var zero tailcfg.NodeView
 
 	// Normalize IPv4-mapped IPv6 addresses (e.g. "::ffff:100.87.98.86") to
 	// their canonical IPv4 form so the lookup matches the node's IPv4 address.
 	ipp = netip.AddrPortFrom(ipp.Addr().Unmap(), ipp.Port())
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	failf := func(format string, args ...any) (tailcfg.NodeView, tailcfg.UserProfile, bool) {
 		if debugWhoIs() {

@@ -2870,6 +2870,80 @@ func TestWhoIs(t *testing.T) {
 	expectWhois(t, testsRound3, b)
 }
 
+// TestWhoIsProxyMapMissWithoutBackendLock checks that WhoIs never needs
+// b.mu: a lookup that misses the netmap and then sleeps through every
+// ProxyMapper registration retry runs to completion while another
+// goroutine holds b.mu, and a proxied lookup resolves the same way.
+func TestWhoIsProxyMapMissWithoutBackendLock(t *testing.T) {
+	b := newTestLocalBackend(t)
+	b.setNetMapLocked(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			ID:        1,
+			User:      10,
+			Key:       makeNodeKeyFromID(1),
+			Addresses: []netip.Prefix{netip.MustParsePrefix("100.101.102.103/32")},
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			(&tailcfg.Node{
+				ID:        2,
+				User:      20,
+				Key:       makeNodeKeyFromID(2),
+				Addresses: []netip.Prefix{netip.MustParsePrefix("100.200.200.200/32")},
+			}).View(),
+		},
+		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
+			10: (&tailcfg.UserProfile{DisplayName: "Myself"}).View(),
+			20: (&tailcfg.UserProfile{DisplayName: "Peer2"}).View(),
+		},
+	})
+	proxied := netip.MustParseAddrPort("127.0.0.1:4242")
+	if err := b.sys.ProxyMapper().RegisterIPPortIdentity("tcp", proxied, netip.MustParseAddr("100.200.200.200")); err != nil {
+		t.Fatal(err)
+	}
+
+	type whoIsResult struct {
+		id      tailcfg.NodeID
+		ok      bool
+		elapsed time.Duration
+	}
+	whoIs := func(proto string, ipp netip.AddrPort) whoIsResult {
+		t.Helper()
+		done := make(chan whoIsResult, 1)
+		go func() {
+			start := time.Now()
+			n, _, ok := b.WhoIs(proto, ipp)
+			var id tailcfg.NodeID
+			if ok {
+				id = n.ID()
+			}
+			done <- whoIsResult{id, ok, time.Since(start)}
+		}()
+		select {
+		case r := <-done:
+			return r
+		case <-time.After(10 * time.Second):
+			t.Fatalf("WhoIs(%q, %v) blocked while another goroutine held b.mu", proto, ipp)
+			return whoIsResult{}
+		}
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	miss := whoIs("", netip.MustParseAddrPort("127.0.0.1:9999"))
+	if miss.ok {
+		t.Fatalf("WhoIs of an unproxied port = node %v; want a miss", miss.id)
+	}
+	if miss.elapsed < 100*time.Millisecond {
+		t.Fatalf("WhoIs miss took %v; want it to have slept through the ProxyMapper retries", miss.elapsed)
+	}
+
+	hit := whoIs("tcp", proxied)
+	if !hit.ok || hit.id != 2 {
+		t.Fatalf("WhoIs of a proxied port = (%v, %v); want node 2", hit.id, hit.ok)
+	}
+}
+
 func TestWireguardExitNodeDNSResolvers(t *testing.T) {
 	type tc struct {
 		name          string
